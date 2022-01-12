@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <iostream>
+#include <syncstream>
 #include <sstream>
 #include <cstdlib>
 #include <string>
@@ -10,7 +11,6 @@
 #include <map>
 #include <chrono>
 #include <future>
-
 
 struct User {
 	std::string password;
@@ -26,7 +26,7 @@ std::shared_mutex has_login_mutex;
 
 // 作业要求1：把这些函数变成多线程安全的
 // 提示：能正确利用 shared_mutex 加分，用 lock_guard 系列加分
-std::string do_register(std::string username, std::string password, std::string school, std::string phone) {	
+std::string do_register(std::string username, std::string password, std::string school, std::string phone) {
 	User user = { password, school, phone };
 	std::lock_guard users_lock{ users_mutex };
 	if (users.emplace(username, user).second) {
@@ -41,18 +41,18 @@ std::string do_login(std::string username, std::string password) {
 	// 作业要求2：把这个登录计时器改成基于 chrono 的
 	auto now = std::chrono::steady_clock::now();   // C 语言当前时间
 	{
-		std::shared_lock has_login_lock_1{ has_login_mutex };
+		std::shared_lock has_login_lock{ has_login_mutex };
 		if (has_login.find(username) != has_login.end()) {
 			auto sec = now - has_login.at(username);  // C 语言算时间差
 			return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(sec).count()) + "秒内登录过";
 		}
 	}
 	{
-		std::lock_guard has_login_lock_2{ has_login_mutex };
+		std::lock_guard has_login_lock{ has_login_mutex };
 		has_login[username] = now;
 	}
 	std::shared_lock users_lock{ users_mutex };
-	if (users.find(username) == users.end()){
+	if (users.find(username) == users.end()) {
 		return "用户名错误";
 	}
 	if (users.at(username).password != password) {
@@ -63,12 +63,17 @@ std::string do_login(std::string username, std::string password) {
 
 std::string do_queryuser(std::string username) {
 	std::shared_lock users_lock{ users_mutex };
-	auto& user = users.at(username);
-	std::stringstream ss;
-	ss << "用户名: " << username << std::endl;
-	ss << "学校:" << user.school << std::endl;
-	ss << "电话: " << user.phone << std::endl;
-	return ss.str();
+	if (users.contains(username)) {
+		std::stringstream ss;
+		auto& user = users.at(username);
+		ss << "用户名: " << username << std::endl;
+		ss << "学校:" << user.school << std::endl;
+		ss << "电话: " << user.phone << std::endl;
+		return ss.str();
+	}
+	else {
+		return "该用户名不存在";
+	}
 }
 
 class ThreadPool {
@@ -87,21 +92,22 @@ public:
 		}
 	}
 
-	//~ThreadPool() {
-	//	//_cv.notify_all();
-	//	for (auto& thread : _threads) {
-	//		if (thread.joinable()) {
-	//			thread.request_stop();
-	//			thread.join();
-	//		}
-	//	}
-	//}
+	template<typename F, typename... Args>
+	void execute(F&& f, Args&&... args) {
+		_tasks.emplace(
+			[_f = FWD(f), ..._args = FWD(args)]() mutable  {
+			std::invoke(_f, _args...);
+		});
+	}
 
 	template<typename F, typename... Args>
-	auto create(F&& f, Args&&... args) {
-		auto taskPtr = std::make_shared<std::packaged_task<std::invoke_result_t<F, Args...>()>>(
-			std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-			);
+	auto create_future(F&& f, Args&&... args) {
+		using Res = std::invoke_result_t<F, Args...>();
+
+		auto taskPtr = std::make_shared<std::packaged_task<Res>>(
+			[_f = FWD(f), ..._args = FWD(args)]() mutable  {
+			return std::invoke(_f, _args...);
+		});
 
 		_tasks.emplace([taskPtr]() { (*taskPtr)(); });
 
@@ -109,10 +115,8 @@ public:
 	}
 
 private:
-	std::vector<std::jthread> _threads;
 	ThreadSafeQueue<std::function<void()>> _tasks;
-	//std::mutex _mtx;
-	//std::condition_variable _cv;
+	std::vector<std::jthread> _threads;
 };
 
 //struct ThreadPool {
@@ -132,16 +136,34 @@ namespace test {  // 测试用例？出水用力！
 }
 
 int main() {
-	ThreadPool tpool(8);
-	std::vector<std::future<std::string>> results;
+	ThreadPool tpool(16);
+
+	// 不使用Future
+
 	for (int i = 0; i < 262144; i++) {
-		results.emplace_back(tpool.create([&] {
+		tpool.execute([&] {
+			std::osyncstream(std::cout) << do_register(test::username[rand() % 4], test::password[rand() % 4], test::school[rand() % 4], test::phone[rand() % 4]) << std::endl;
+			});
+		tpool.execute([&] {
+			std::osyncstream(std::cout) << do_login(test::username[rand() % 4], test::password[rand() % 4]) << std::endl;
+			});
+		tpool.execute([&] {
+			std::osyncstream(std::cout) << do_queryuser(test::username[rand() % 4]) << std::endl;
+			});
+	}
+
+	// 使用Future
+	/*
+	std::vector<std::future<std::string>> results;
+
+	for (int i = 0; i < 262144; i++) {
+		results.emplace_back(tpool.create_future([&] {
 			return do_register(test::username[rand() % 4], test::password[rand() % 4], test::school[rand() % 4], test::phone[rand() % 4]);
 			}));
-		results.emplace_back(tpool.create([&] {
+		results.emplace_back(tpool.create_future([&] {
 			return do_login(test::username[rand() % 4], test::password[rand() % 4]);
 			}));
-		results.emplace_back(tpool.create([&] {
+		results.emplace_back(tpool.create_future([&] {
 			return do_queryuser(test::username[rand() % 4]);
 			}));
 	}
@@ -149,7 +171,7 @@ int main() {
 	for (auto& result : results) {
 		std::cout << result.get() << std::endl;
 	}
-
+	*/
 	// 作业要求4：等待 tpool 中所有线程都结束后再退出
 	return 0;
 }
